@@ -1,0 +1,628 @@
+# Argo Workflow Template for ML Training Pipeline
+# Demonstrates: data loading, validation, feature engineering, training, and model registration
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ml-training-pipeline
+  namespace: argo
+  labels:
+    app: mlops
+    pipeline: training
+spec:
+  entrypoint: ml-pipeline
+  serviceAccountName: argo-workflow
+
+  # Maximum runtime for the entire workflow (2 hours)
+  activeDeadlineSeconds: 7200
+
+  # Security context for all pods in this workflow
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  # OpenTelemetry configuration for all pipeline steps
+  podSpecPatch: |
+    containers:
+      - name: main
+        env:
+          - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            value: "otel-collector.monitoring:4317"
+
+  # Pipeline parameters with defaults
+  arguments:
+    parameters:
+      - name: pipeline-image
+        # Pinned Git-SHA tag from build-sign-publish. Mutable tags (:main,
+        # :latest) are rejected at admission (governance/
+        # immutable-image-tags-policy.yaml) - with IfNotPresent caching they
+        # hide which build a pod actually runs. Submissions should still
+        # pass the current SHA explicitly:
+        #   argo submit --from workflowtemplate/ml-training-pipeline \
+        #     -p pipeline-image=ghcr.io/sathvikvelapaka/mlops-platform/ml-training:$(git rev-parse --short HEAD)
+        value: "ghcr.io/sathvikvelapaka/mlops-platform/ml-training:78aaa28"
+      - name: dataset-url
+        value: "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv"
+      - name: target-column
+        value: "species"
+      - name: model-name
+        value: "iris-classifier"
+      - name: mlflow-tracking-uri
+        value: "http://mlflow.mlflow.svc.cluster.local:5000"
+      - name: accuracy-threshold
+        value: "0.9"
+      - name: n-estimators
+        value: "100"
+      - name: max-depth
+        value: "10"
+      - name: test-size
+        value: "0.2"
+      - name: random-state
+        value: "42"
+      - name: model-alias
+        value: "champion"
+      # Data validation parameters
+      - name: min-rows
+        value: "10"
+      - name: null-threshold
+        value: "0.5"
+      # Training parameters
+      - name: cv-folds
+        value: "5"
+      - name: use-cross-validation
+        value: "true"
+      - name: use-grid-search
+        value: "false"
+
+  # Artifact storage using MinIO
+  artifactRepositoryRef:
+    configMap: artifact-repositories
+    key: default-artifact-repository
+
+  templates:
+    # Main pipeline DAG
+    - name: ml-pipeline
+      dag:
+        tasks:
+          - name: load-data
+            template: load-data
+            arguments:
+              parameters:
+                - name: dataset-url
+                  value: "{{workflow.parameters.dataset-url}}"
+
+          - name: validate-data
+            template: validate-data
+            dependencies: [load-data]
+            arguments:
+              parameters:
+                - name: min-rows
+                  value: "{{workflow.parameters.min-rows}}"
+                - name: null-threshold
+                  value: "{{workflow.parameters.null-threshold}}"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.load-data.outputs.artifacts.output-data}}"
+
+          - name: feature-engineering
+            template: feature-engineering
+            dependencies: [validate-data]
+            arguments:
+              parameters:
+                - name: target-column
+                  value: "{{workflow.parameters.target-column}}"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.validate-data.outputs.artifacts.output-data}}"
+
+          - name: train-model
+            template: train-model
+            dependencies: [feature-engineering]
+            arguments:
+              parameters:
+                - name: target-column
+                  value: "{{workflow.parameters.target-column}}"
+                - name: model-name
+                  value: "{{workflow.parameters.model-name}}"
+                - name: mlflow-tracking-uri
+                  value: "{{workflow.parameters.mlflow-tracking-uri}}"
+                - name: n-estimators
+                  value: "{{workflow.parameters.n-estimators}}"
+                - name: max-depth
+                  value: "{{workflow.parameters.max-depth}}"
+                - name: test-size
+                  value: "{{workflow.parameters.test-size}}"
+                - name: random-state
+                  value: "{{workflow.parameters.random-state}}"
+                - name: cv-folds
+                  value: "{{workflow.parameters.cv-folds}}"
+                - name: use-cross-validation
+                  value: "{{workflow.parameters.use-cross-validation}}"
+                - name: use-grid-search
+                  value: "{{workflow.parameters.use-grid-search}}"
+              artifacts:
+                - name: input-data
+                  from: "{{tasks.feature-engineering.outputs.artifacts.output-data}}"
+                - name: preprocessor
+                  from: "{{tasks.feature-engineering.outputs.artifacts.preprocessor}}"
+
+          - name: validate-model
+            template: validate-model
+            dependencies: [train-model]
+            arguments:
+              parameters:
+                - name: target-column
+                  value: "{{workflow.parameters.target-column}}"
+                - name: accuracy-threshold
+                  value: "{{workflow.parameters.accuracy-threshold}}"
+              artifacts:
+                - name: model
+                  from: "{{tasks.train-model.outputs.artifacts.model}}"
+                - name: input-data
+                  from: "{{tasks.feature-engineering.outputs.artifacts.output-data}}"
+
+          # Build the raw-input serving pyfunc BEFORE registration so the
+          # registered version is the serving model with bundled
+          # preprocessing, not the bare sklearn model that expects
+          # pre-transformed features.
+          - name: build-serving-model
+            template: build-serving-model
+            dependencies: [validate-model]
+            arguments:
+              parameters:
+                - name: mlflow-tracking-uri
+                  value: "{{workflow.parameters.mlflow-tracking-uri}}"
+                - name: run-id
+                  value: "{{tasks.train-model.outputs.parameters.run-id}}"
+                - name: target-column
+                  value: "{{workflow.parameters.target-column}}"
+              artifacts:
+                - name: model
+                  from: "{{tasks.train-model.outputs.artifacts.model}}"
+                - name: preprocessor
+                  from: "{{tasks.feature-engineering.outputs.artifacts.preprocessor}}"
+                # RAW validated data, not the feature-engineered CSV: the
+                # serving pyfunc's contract is raw features, and the sample
+                # input drives its logged signature.
+                - name: input-data
+                  from: "{{tasks.validate-data.outputs.artifacts.output-data}}"
+
+          # Load-test the serving artifact IN THE SERVING RUNTIME IMAGE
+          # before registration. Catches interpreter/pickle/library
+          # mismatches between the training image and MLServer at pipeline
+          # time - an unloadable model must never earn the champion alias.
+          - name: serving-load-test
+            template: serving-load-test
+            dependencies: [build-serving-model]
+            arguments:
+              artifacts:
+                - name: serving-model
+                  from: "{{tasks.build-serving-model.outputs.artifacts.serving-model}}"
+
+          - name: register-model
+            template: register-model
+            dependencies: [serving-load-test]
+            arguments:
+              parameters:
+                - name: model-name
+                  value: "{{workflow.parameters.model-name}}"
+                - name: mlflow-tracking-uri
+                  value: "{{workflow.parameters.mlflow-tracking-uri}}"
+                - name: accuracy-threshold
+                  value: "{{workflow.parameters.accuracy-threshold}}"
+                - name: model-alias
+                  value: "{{workflow.parameters.model-alias}}"
+                - name: run-id
+                  value: "{{tasks.train-model.outputs.parameters.run-id}}"
+                - name: artifact-path
+                  value: "serving_model"
+
+    # Step 1: Load data from URL
+    - name: load-data
+      retryStrategy:
+        limit: 2
+        retryPolicy: "OnError"
+      memoize:
+        # Memoize keys become ConfigMap keys ([-._a-zA-Z0-9] only) - a raw
+        # URL is invalid and errored the whole DAG. Hash it.
+        key: "load-data-{{=sprig.sha256sum(inputs.parameters['dataset-url'])}}"
+        maxAge: "24h"
+        cache:
+          configMap:
+            name: pipeline-cache
+      inputs:
+        parameters:
+          - name: dataset-url
+      outputs:
+        artifacts:
+          - name: output-data
+            path: /tmp/data.csv
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/training/src/load_data.py]
+        args:
+          - --url
+          - "{{inputs.parameters.dataset-url}}"
+          - --output
+          - /tmp/data.csv
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 2: Validate data quality
+    - name: validate-data
+      retryStrategy:
+        limit: 2
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: min-rows
+          - name: null-threshold
+        artifacts:
+          - name: input-data
+            path: /tmp/input.csv
+      outputs:
+        artifacts:
+          - name: output-data
+            path: /tmp/validated.csv
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/training/src/validate_data.py]
+        args:
+          - --input
+          - /tmp/input.csv
+          - --output
+          - /tmp/validated.csv
+          - --min-rows
+          - "{{inputs.parameters.min-rows}}"
+          - --null-threshold
+          - "{{inputs.parameters.null-threshold}}"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 3: Feature engineering
+    - name: feature-engineering
+      retryStrategy:
+        limit: 2
+        retryPolicy: "OnError"
+      memoize:
+        # Keyed on dataset URL (hashed - raw URLs are invalid ConfigMap keys)
+        # + target column, so a dataset change within maxAge cannot serve a
+        # stale features artifact.
+        key: "feature-eng-{{=sprig.sha256sum(workflow.parameters['dataset-url'])}}-{{inputs.parameters.target-column}}"
+        maxAge: "24h"
+        cache:
+          configMap:
+            name: pipeline-cache
+      inputs:
+        parameters:
+          - name: target-column
+        artifacts:
+          - name: input-data
+            path: /tmp/input.csv
+      outputs:
+        artifacts:
+          - name: output-data
+            path: /tmp/features.csv
+          - name: preprocessor
+            path: /tmp/features_preprocessor.joblib
+            optional: true
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/training/src/feature_engineering.py]
+        args:
+          - --input
+          - /tmp/input.csv
+          - --output
+          - /tmp/features.csv
+          - --target
+          - "{{inputs.parameters.target-column}}"
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 4: Train model with MLflow tracking
+    - name: train-model
+      retryStrategy:
+        limit: 1
+        retryPolicy: "OnFailure"
+      inputs:
+        parameters:
+          - name: target-column
+          - name: model-name
+          - name: mlflow-tracking-uri
+          - name: n-estimators
+          - name: max-depth
+          - name: test-size
+          - name: random-state
+          - name: cv-folds
+          - name: use-cross-validation
+          - name: use-grid-search
+        artifacts:
+          - name: input-data
+            path: /tmp/input.csv
+          - name: preprocessor
+            path: /tmp/preprocessor.joblib
+            optional: true
+      outputs:
+        parameters:
+          - name: run-id
+            valueFrom:
+              path: /tmp/run_id.txt
+          - name: accuracy
+            valueFrom:
+              path: /tmp/accuracy.txt
+        artifacts:
+          - name: model
+            path: /tmp/model.joblib
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [sh, -c]
+        args:
+          - |
+            CV_FLAG="" && \
+            if [ "{{inputs.parameters.use-cross-validation}}" = "false" ]; then CV_FLAG="--no-cv"; fi && \
+            GS_FLAG="" && \
+            if [ "{{inputs.parameters.use-grid-search}}" = "true" ]; then GS_FLAG="--grid-search"; fi && \
+            python /app/pipelines/training/src/train_model.py \
+              --input /tmp/input.csv \
+              --model-output /tmp/model.joblib \
+              --run-id-output /tmp/run_id.txt \
+              --accuracy-output /tmp/accuracy.txt \
+              --target "{{inputs.parameters.target-column}}" \
+              --model-name "{{inputs.parameters.model-name}}" \
+              --mlflow-uri "{{inputs.parameters.mlflow-tracking-uri}}" \
+              --n-estimators "{{inputs.parameters.n-estimators}}" \
+              --max-depth "{{inputs.parameters.max-depth}}" \
+              --test-size "{{inputs.parameters.test-size}}" \
+              --random-state "{{inputs.parameters.random-state}}" \
+              --cv-folds "{{inputs.parameters.cv-folds}}" \
+              $CV_FLAG $GS_FLAG
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 5: Validate model quality gate
+    - name: validate-model
+      retryStrategy:
+        limit: 1
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: target-column
+          - name: accuracy-threshold
+        artifacts:
+          - name: model
+            path: /tmp/model.joblib
+          - name: input-data
+            path: /tmp/input.csv
+      outputs:
+        parameters:
+          - name: validation-result
+            valueFrom:
+              path: /tmp/validation_result.txt
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/training/src/validate_model.py]
+        args:
+          - --model
+          - /tmp/model.joblib
+          - --data
+          - /tmp/input.csv
+          - --target
+          - "{{inputs.parameters.target-column}}"
+          - --accuracy-threshold
+          - "{{inputs.parameters.accuracy-threshold}}"
+          - --result-output
+          - /tmp/validation_result.txt
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 6: Register model with MLflow alias
+    - name: register-model
+      retryStrategy:
+        limit: 2
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: model-name
+          - name: mlflow-tracking-uri
+          - name: accuracy-threshold
+          - name: model-alias
+          - name: run-id
+          - name: artifact-path
+            value: "model"
+      outputs:
+        parameters:
+          - name: model-version
+            valueFrom:
+              path: /tmp/model_version.txt
+          - name: model-alias
+            valueFrom:
+              path: /tmp/model_alias.txt
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/training/src/register_model.py]
+        args:
+          - --model-name
+          - "{{inputs.parameters.model-name}}"
+          - --mlflow-uri
+          - "{{inputs.parameters.mlflow-tracking-uri}}"
+          - --threshold
+          - "{{inputs.parameters.accuracy-threshold}}"
+          - --alias
+          - "{{inputs.parameters.model-alias}}"
+          - --run-id
+          - "{{inputs.parameters.run-id}}"
+          - --artifact-path
+          - "{{inputs.parameters.artifact-path}}"
+          - --version-output
+          - /tmp/model_version.txt
+          - --alias-output
+          - /tmp/model_alias.txt
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 7: Build serving model with bundled preprocessing
+    - name: build-serving-model
+      retryStrategy:
+        limit: 1
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: mlflow-tracking-uri
+          - name: run-id
+          - name: target-column
+            value: "species"
+        artifacts:
+          - name: model
+            path: /tmp/model.joblib
+          - name: preprocessor
+            path: /tmp/preprocessor.joblib
+            optional: true
+          - name: input-data
+            path: /tmp/input.csv
+      outputs:
+        artifacts:
+          - name: serving-model
+            path: /tmp/serving_model
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/training/src/build_serving_model.py]
+        args:
+          - --model
+          - /tmp/model.joblib
+          - --preprocessor
+          - /tmp/preprocessor.joblib
+          - --run-id
+          - "{{inputs.parameters.run-id}}"
+          - --mlflow-uri
+          - "{{inputs.parameters.mlflow-tracking-uri}}"
+          - --sample-input
+          - /tmp/input.csv
+          - --target-column
+          - "{{inputs.parameters.target-column}}"
+          - --local-copy
+          - /tmp/serving_model
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Gate: unpickle and score the serving model inside the SAME image
+    # KServe will serve it with (examples/kserve template pins
+    # runtimeVersion 1.7.1). The artifact arrives as a local directory -
+    # exactly what the storage-initializer hands MLServer - so this
+    # exercises the real load path with no network or cloud credentials.
+    # Failure here blocks register-model: no champion for unloadable models.
+    - name: serving-load-test
+      retryStrategy:
+        limit: 1
+        retryPolicy: "OnError"
+      inputs:
+        artifacts:
+          - name: serving-model
+            path: /tmp/serving_model
+      script:
+        # Must be the image KServe serves with. Source of truth:
+        # pipelines/serving-runtime-contract.yaml (drift fails CI).
+        image: docker.io/seldonio/mlserver:1.7.1-mlflow
+        command: [python]
+        source: |
+          import sys
+
+          from mlflow.models import validate_serving_input
+          from mlflow.models.utils import load_serving_example
+
+          MODEL_DIR = "/tmp/serving_model"
+
+          print(f"Python {sys.version.split()[0]} - loading serving example")
+          serving_example = load_serving_example(MODEL_DIR)
+
+          # Loads the pyfunc (unpickle happens HERE, in the serving
+          # runtime's interpreter) and scores the logged input example.
+          prediction = validate_serving_input(MODEL_DIR, serving_example)
+          print(f"Serving load test OK - prediction: {prediction}")
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+---
+# Workflow to run the training pipeline
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: ml-training-
+  namespace: argo
+  labels:
+    app: mlops
+    pipeline: training
+spec:
+  workflowTemplateRef:
+    name: ml-training-pipeline

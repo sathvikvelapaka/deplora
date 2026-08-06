@@ -1,0 +1,399 @@
+"""
+Train ML model for pipeline.
+
+This module trains a RandomForest classifier, logs metrics and parameters
+to MLflow, and saves the trained model.
+"""
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+
+import joblib
+import mlflow
+import numpy as np
+import pandas as pd
+from mlflow.exceptions import MlflowException
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import GridSearchCV, cross_val_score, train_test_split
+
+from pipelines.shared.exceptions import MLflowTimeoutError, ModelTrainingError
+from pipelines.shared.logging_utils import get_logger
+from pipelines.shared.mlflow_utils import MLFLOW_CONNECTION_TIMEOUT, run_with_timeout
+from pipelines.training.src.tracing import get_tracer
+
+logger = get_logger(__name__)
+tracer = get_tracer("train-model")
+
+
+DEFAULT_PARAM_GRID = {
+    "n_estimators": [50, 100, 200],
+    "max_depth": [5, 10, 20],
+}
+
+
+# Split indicator column written by feature_engineering (1 = train row).
+# When present, training respects the upstream leakage-free split instead
+# of re-splitting data the preprocessor was fitted on.
+SPLIT_COLUMN = "is_train"
+
+
+@dataclass
+class TrainingResult:
+    """Result of model training operation."""
+
+    model_path: str
+    run_id: str
+    accuracy: float
+    f1: float
+    cv_mean: float | None = None
+    cv_std: float | None = None
+    best_params: dict | None = None
+    success: bool = True
+    error_message: str | None = None
+
+
+def train_model(
+    input_path: str,
+    model_output_path: str,
+    target: str,
+    model_name: str,
+    mlflow_uri: str,
+    n_estimators: int,
+    max_depth: int,
+    test_size: float,
+    run_id_output_path: str,
+    accuracy_output_path: str,
+    random_state: int = 42,
+    cv_folds: int = 5,
+    use_cross_validation: bool = True,
+    use_grid_search: bool = False,
+    mlflow_timeout_seconds: int = MLFLOW_CONNECTION_TIMEOUT,
+) -> TrainingResult:
+    """
+    Train a RandomForest classifier and log to MLflow.
+
+    Args:
+        input_path: Path to input CSV with features and target.
+        model_output_path: Path to save trained model (.joblib).
+        target: Name of target column.
+        model_name: Name for MLflow experiment.
+        mlflow_uri: MLflow tracking server URI.
+        n_estimators: Number of trees in the forest.
+        max_depth: Maximum depth of trees.
+        test_size: Proportion of data for test set.
+        run_id_output_path: Path to save MLflow run ID.
+        accuracy_output_path: Path to save accuracy metric.
+        random_state: Random seed for reproducibility (default: 42).
+        cv_folds: Number of cross-validation folds (default: 5).
+        use_cross_validation: Whether to perform cross-validation (default: True).
+        use_grid_search: Whether to perform GridSearchCV hyperparameter tuning (default: False).
+        mlflow_timeout_seconds: Timeout in seconds for MLflow connection (default: 30).
+
+    Returns:
+        TrainingResult containing model path, run ID, metrics, and CV scores.
+
+    Raises:
+        ModelTrainingError: If training fails due to data or MLflow issues.
+    """
+    logger.info(f"Starting model training with data from {input_path}")
+
+    with tracer.start_as_current_span("train_model") as span:
+        span.set_attribute("input_path", input_path)
+        span.set_attribute("model_name", model_name)
+        span.set_attribute("n_estimators", n_estimators)
+        span.set_attribute("max_depth", max_depth)
+
+        # Input validation
+        if n_estimators < 1:
+            raise ModelTrainingError(f"n_estimators must be >= 1, got: {n_estimators}")
+        if max_depth < 1:
+            raise ModelTrainingError(f"max_depth must be >= 1, got: {max_depth}")
+        if not 0.0 < test_size < 1.0:
+            raise ModelTrainingError(
+                f"test_size must be between 0 and 1 (exclusive), got: {test_size}"
+            )
+        if mlflow_timeout_seconds < 1 or mlflow_timeout_seconds > 300:
+            raise ModelTrainingError(
+                f"mlflow_timeout_seconds must be between 1 and 300, got: {mlflow_timeout_seconds}"
+            )
+
+        try:
+            # Setup MLflow with timeout to prevent indefinite hangs
+            logger.info(
+                f"Connecting to MLflow at {mlflow_uri} (timeout: {mlflow_timeout_seconds}s)"
+            )
+
+            def _setup_mlflow() -> None:
+                mlflow.set_tracking_uri(mlflow_uri)
+                mlflow.set_experiment(model_name)
+
+            run_with_timeout(
+                _setup_mlflow,
+                seconds=mlflow_timeout_seconds,
+                error_message=f"MLflow connection timed out after {mlflow_timeout_seconds}s",
+            )
+            logger.info(f"MLflow tracking URI: {mlflow_uri}, Experiment: {model_name}")
+        except MLflowTimeoutError as e:
+            raise ModelTrainingError(
+                f"MLflow connection timed out after {mlflow_timeout_seconds}s. "
+                f"Check: 1) MLflow pod is running (kubectl get pods -n mlflow), "
+                f"2) Service is accessible (kubectl get svc -n mlflow), "
+                f"3) Network policies allow access, 4) MLflow URI is correct: {mlflow_uri}"
+            ) from e
+        except MlflowException as e:
+            raise ModelTrainingError(
+                f"Failed to setup MLflow: {e}. "
+                f"Check: 1) MLflow pod logs (kubectl logs -n mlflow -l app=mlflow), "
+                f"2) Database connectivity (kubectl exec -n mlflow deployment/mlflow -- psql $MLFLOW_BACKEND_STORE_URI -c 'SELECT 1'), "
+                f"3) Storage access (S3/Blob/GCS permissions), 4) MLflow URI format: {mlflow_uri}"
+            ) from e
+
+        try:
+            # Load data
+            df = pd.read_csv(input_path)
+            logger.info(f"Loaded {len(df)} rows from {input_path}")
+        except FileNotFoundError as e:
+            raise ModelTrainingError(
+                f"Input file not found: {input_path}. "
+                f"Check: 1) Previous pipeline step completed successfully, "
+                f"2) Artifact path is correct, 3) Argo Workflow artifact storage is accessible"
+            ) from e
+        except pd.errors.EmptyDataError as e:
+            raise ModelTrainingError(
+                f"Input file is empty: {input_path}. "
+                f"Check: 1) Data source contains data, 2) Data validation step passed, "
+                f"3) File was not truncated during transfer"
+            ) from e
+
+        if target not in df.columns:
+            raise ModelTrainingError(
+                f"Target column '{target}' not found. Available: {list(df.columns)}"
+            )
+
+        if SPLIT_COLUMN in df.columns:
+            # Respect the leakage-free split from feature_engineering: the
+            # preprocessor was fitted on is_train==1 rows only, so held-out
+            # rows must stay held out here too.
+            train_mask = df[SPLIT_COLUMN] == 1
+            features = df.drop(columns=[target, SPLIT_COLUMN])
+            X_train, X_test = features[train_mask], features[~train_mask]
+            y_train, y_test = df[target][train_mask], df[target][~train_mask]
+            logger.info(
+                f"Using upstream '{SPLIT_COLUMN}' split: {len(X_train)} train / {len(X_test)} test"
+            )
+        else:
+            # Fallback for data without a split indicator (e.g. direct CLI use)
+            X = df.drop(columns=[target])
+            y = df[target]
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state, stratify=y
+            )
+            logger.info(f"Internal split - Train set: {len(X_train)}, Test set: {len(X_test)}")
+
+        try:
+            with mlflow.start_run() as run:
+                run_id = run.info.run_id
+                logger.info(f"Starting MLflow run: {run_id}")
+
+                # Log parameters
+                params = {
+                    "n_estimators": n_estimators,
+                    "max_depth": max_depth,
+                    "test_size": test_size,
+                    "random_state": random_state,
+                    "cv_folds": cv_folds,
+                    "use_cross_validation": use_cross_validation,
+                }
+                mlflow.log_params(params)
+                logger.info(f"Training parameters: {params}")
+
+                # Train model (limit n_jobs to avoid oversubscription in Kubernetes)
+                n_jobs = min(4, os.cpu_count() or 1)
+                model = RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    random_state=random_state,
+                    n_jobs=n_jobs,
+                )
+
+                # Perform cross-validation if enabled.
+                # CV runs on the TRAINING partition only — held-out test rows
+                # must not influence model selection. Note: features were
+                # scaled by a preprocessor fitted on the whole training
+                # partition, so CV folds share those statistics; the clean,
+                # unbiased number is the held-out test accuracy below.
+                cv_mean = None
+                cv_std = None
+                if use_cross_validation and len(X_train) >= cv_folds:
+                    logger.info(f"Performing {cv_folds}-fold cross-validation on train partition")
+                    cv_scores = cross_val_score(
+                        model, X_train, y_train, cv=cv_folds, scoring="accuracy", n_jobs=n_jobs
+                    )
+                    cv_mean = float(np.mean(cv_scores))
+                    cv_std = float(np.std(cv_scores))
+                    logger.info(f"CV Scores: {cv_scores}")
+                    logger.info(f"CV Mean: {cv_mean:.4f} (+/- {cv_std:.4f})")
+                    mlflow.log_metrics({"cv_mean_accuracy": cv_mean, "cv_std_accuracy": cv_std})
+
+                # Optional GridSearchCV hyperparameter tuning
+                best_params = None
+                if use_grid_search:
+                    logger.info("Performing GridSearchCV hyperparameter tuning")
+                    grid_search = GridSearchCV(
+                        estimator=model,
+                        param_grid=DEFAULT_PARAM_GRID,
+                        cv=cv_folds,
+                        scoring="accuracy",
+                        n_jobs=n_jobs,
+                        refit=True,
+                    )
+                    grid_search.fit(X_train, y_train)
+                    model = grid_search.best_estimator_
+                    best_params = grid_search.best_params_
+                    logger.info(f"Best params: {best_params}")
+                    logger.info(f"Best CV score: {grid_search.best_score_:.4f}")
+                    mlflow.log_params({f"best_{k}": v for k, v in best_params.items()})
+                    mlflow.log_metric("grid_search_best_score", grid_search.best_score_)
+                else:
+                    # Train final model on training set
+                    model.fit(X_train, y_train)
+
+                logger.info("Model training completed")
+
+                # Evaluate on test set
+                y_pred = model.predict(X_test)
+                accuracy = accuracy_score(y_test, y_pred)
+                f1 = f1_score(y_test, y_pred, average="weighted")
+
+                span.set_attribute("accuracy", accuracy)
+                span.set_attribute("f1_score", f1)
+
+                logger.info(f"Metrics - Accuracy: {accuracy:.4f}, F1: {f1:.4f}")
+                mlflow.log_metrics({"accuracy": accuracy, "f1_score": f1})
+
+                # SHAP feature importance (optional — skip if shap not installed)
+                try:
+                    import shap
+
+                    explainer = shap.TreeExplainer(model)
+                    X_test_sample = X_test[:100] if len(X_test) > 100 else X_test
+                    shap_values = explainer.shap_values(X_test_sample)
+                    if isinstance(shap_values, list):
+                        # Multi-class: average absolute SHAP values across classes
+                        mean_shap = np.mean([np.abs(sv).mean(axis=0) for sv in shap_values], axis=0)
+                    else:
+                        mean_shap = np.abs(shap_values).mean(axis=0)
+                    feature_names = (
+                        X_test.columns
+                        if hasattr(X_test, "columns")
+                        else [f"feature_{i}" for i in range(len(mean_shap))]
+                    )
+                    for fname, importance in zip(feature_names, mean_shap, strict=False):
+                        mlflow.log_metric(f"shap_importance_{fname}", float(importance))
+                    logger.info(
+                        "Logged SHAP feature importance for %d features", len(feature_names)
+                    )
+                except Exception as shap_err:
+                    logger.warning("SHAP feature importance skipped: %s", shap_err)
+
+                # Log model to MLflow
+                mlflow.sklearn.log_model(model, "model", input_example=X_train.head(1))
+
+                # Save outputs locally
+                os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
+                joblib.dump(model, model_output_path)
+                logger.info(f"Model saved to {model_output_path}")
+
+                # Ensure output directories exist for run ID and accuracy files
+                for out_path in [run_id_output_path, accuracy_output_path]:
+                    out_dir = os.path.dirname(out_path)
+                    if out_dir:
+                        os.makedirs(out_dir, exist_ok=True)
+
+                # Save run ID and accuracy for next pipeline steps
+                with open(run_id_output_path, "w") as f:
+                    f.write(run_id)
+                with open(accuracy_output_path, "w") as f:
+                    f.write(str(accuracy))
+
+                return TrainingResult(
+                    model_path=model_output_path,
+                    run_id=run_id,
+                    accuracy=accuracy,
+                    f1=f1,
+                    cv_mean=cv_mean,
+                    cv_std=cv_std,
+                    best_params=best_params,
+                    success=True,
+                )
+
+        except MlflowException as e:
+            raise ModelTrainingError(
+                f"MLflow error during training: {e}. "
+                f"Check: 1) MLflow pod status (kubectl get pods -n mlflow), "
+                f"2) MLflow logs (kubectl logs -n mlflow -l app=mlflow --tail=100), "
+                f"3) Storage backend connectivity (S3/Blob/GCS), 4) Database connection"
+            ) from e
+        except Exception as e:
+            raise ModelTrainingError(
+                f"Training failed: {e}. "
+                f"Check: 1) Input data format and quality, 2) Model hyperparameters, "
+                f"3) Resource limits (CPU/memory), 4) Pod logs for details: kubectl logs -n argo <pod-name>"
+            ) from e
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train model")
+    parser.add_argument("--input", required=True, help="Path to input CSV")
+    parser.add_argument("--model-output", required=True, help="Path to save model (.joblib)")
+    parser.add_argument("--run-id-output", required=True, help="Path to save run ID")
+    parser.add_argument("--accuracy-output", required=True, help="Path to save accuracy")
+
+    parser.add_argument("--target", required=True, help="Target column")
+    parser.add_argument("--model-name", required=True, help="Model name for MLflow")
+    parser.add_argument("--mlflow-uri", required=True, help="MLflow tracking URI")
+
+    parser.add_argument("--n-estimators", type=int, default=100, help="Number of trees")
+    parser.add_argument("--max-depth", type=int, default=10, help="Max depth of trees")
+    parser.add_argument("--test-size", type=float, default=0.2, help="Test set size")
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed")
+    parser.add_argument("--cv-folds", type=int, default=5, help="Cross-validation folds")
+    parser.add_argument("--no-cv", action="store_true", help="Disable cross-validation")
+    parser.add_argument("--grid-search", action="store_true", help="Enable GridSearchCV tuning")
+    parser.add_argument(
+        "--mlflow-timeout",
+        type=int,
+        default=MLFLOW_CONNECTION_TIMEOUT,
+        help="MLflow connection timeout (seconds)",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        result = train_model(
+            args.input,
+            args.model_output,
+            args.target,
+            args.model_name,
+            args.mlflow_uri,
+            args.n_estimators,
+            args.max_depth,
+            args.test_size,
+            args.run_id_output,
+            args.accuracy_output,
+            args.random_state,
+            args.cv_folds,
+            not args.no_cv,
+            use_grid_search=args.grid_search,
+            mlflow_timeout_seconds=args.mlflow_timeout,
+        )
+        cv_info = ""
+        if result.cv_mean is not None:
+            cv_info = f", CV: {result.cv_mean:.4f} (+/- {result.cv_std:.4f})"
+        print(f"Training complete. Accuracy: {result.accuracy:.4f}, F1: {result.f1:.4f}{cv_info}")
+    except ModelTrainingError as e:
+        print(f"Training error: {e}", file=sys.stderr)
+        sys.exit(1)

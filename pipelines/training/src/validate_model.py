@@ -1,0 +1,237 @@
+"""
+Validate trained model before registration.
+
+This module performs quality-gate checks on a freshly trained model,
+including accuracy threshold enforcement and sanity checks on predictions.
+It sits between the train-model and register-model steps in the Argo DAG
+so that clearly deficient models are rejected early.
+"""
+
+import argparse
+import sys
+from dataclasses import dataclass
+
+import joblib
+import numpy as np
+import pandas as pd
+
+from pipelines.shared.exceptions import ModelTrainingError
+from pipelines.shared.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class ModelValidationResult:
+    """Result of model validation checks."""
+
+    passed: bool
+    accuracy: float
+    threshold: float
+    num_classes_predicted: int
+    prediction_failures: int
+    checks: dict[str, bool]
+    error_message: str | None = None
+
+
+def validate_model(
+    model_path: str,
+    data_path: str,
+    target: str,
+    accuracy_threshold: float,
+) -> ModelValidationResult:
+    """Validate a trained model against quality-gate criteria.
+
+    Checks performed:
+    1. **Accuracy threshold** – the model's test-set accuracy (read from the
+       training step's output) must meet or exceed *accuracy_threshold*.
+    2. **Prediction sanity** – the model must predict at least 2 distinct
+       classes on the validation split (catches degenerate models that
+       predict a single class for every input).
+    3. **No prediction failures** – calling ``model.predict`` on the feature
+       matrix must not raise.
+
+    Args:
+        model_path: Path to the trained model (.joblib).
+        data_path: Path to the feature CSV used for training.
+        target: Name of the target column.
+        accuracy_threshold: Minimum required accuracy (0.0–1.0).
+
+    Returns:
+        ModelValidationResult with per-check status.
+
+    Raises:
+        ModelTrainingError: If the model or data cannot be loaded.
+    """
+    logger.info(f"Starting model validation (threshold={accuracy_threshold})")
+
+    if not 0.0 <= accuracy_threshold <= 1.0:
+        raise ModelTrainingError(
+            f"accuracy_threshold must be between 0 and 1, got: {accuracy_threshold}"
+        )
+
+    # Load model
+    try:
+        model = joblib.load(model_path)
+        logger.info(f"Loaded model from {model_path}")
+    except FileNotFoundError as e:
+        raise ModelTrainingError(
+            f"Model file not found: {model_path}. "
+            f"Check: 1) Training step completed successfully, "
+            f"2) Model artifact path is correct, 3) Argo Workflow artifact storage"
+        ) from e
+    except Exception as e:
+        raise ModelTrainingError(
+            f"Failed to load model: {e}. "
+            f"Check: 1) Model file format (joblib/pickle), 2) Model version compatibility, "
+            f"3) File is not corrupted, 4) Required libraries are installed"
+        ) from e
+
+    # Load data
+    try:
+        df = pd.read_csv(data_path)
+        logger.info(f"Loaded {len(df)} rows from {data_path}")
+    except FileNotFoundError as e:
+        raise ModelTrainingError(
+            f"Data file not found: {data_path}. "
+            f"Check: 1) Feature engineering step completed, "
+            f"2) Data artifact path is correct, 3) Argo Workflow artifacts"
+        ) from e
+
+    if target not in df.columns:
+        raise ModelTrainingError(
+            f"Target column '{target}' not found. Available: {list(df.columns)}"
+        )
+
+    # Validate on HELD-OUT rows when the upstream split indicator is present.
+    # Scoring the model on its own training data is a vacuous gate (an
+    # overfit model scores ~1.0); the is_train==0 partition was excluded
+    # from both preprocessor fitting and model training.
+    split_column = "is_train"
+    if split_column in df.columns:
+        held_out = df[df[split_column] == 0].drop(columns=[split_column])
+        if len(held_out) == 0:
+            raise ModelTrainingError(
+                f"'{split_column}' column present but no held-out rows found. "
+                "Check the feature-engineering split configuration."
+            )
+        logger.info(
+            f"Validating on {len(held_out)} held-out rows "
+            f"(of {len(df)} total; '{split_column}' indicator)"
+        )
+        df = held_out
+    else:
+        logger.warning(
+            f"No '{split_column}' column in validation data - metrics are "
+            "computed on data the model may have been trained on and are "
+            "optimistically biased"
+        )
+
+    X = df.drop(columns=[target])
+    y = df[target]
+
+    # --- Check 1: prediction sanity ---
+    prediction_failures = 0
+    try:
+        y_pred = model.predict(X)
+    except Exception as e:
+        logger.error(f"Model prediction failed: {e}")
+        prediction_failures = len(X)
+        y_pred = np.array([])
+
+    predict_ok = prediction_failures == 0
+
+    # Check for NaN/Inf predictions (only applicable to numeric output)
+    if len(y_pred) > 0 and np.issubdtype(y_pred.dtype, np.floating):
+        nan_count = int(np.sum(np.isnan(y_pred)))
+        inf_count = int(np.sum(np.isinf(y_pred)))
+        if nan_count > 0 or inf_count > 0:
+            logger.warning(f"Model produced {nan_count} NaN and {inf_count} Inf predictions")
+            prediction_failures = nan_count + inf_count
+            predict_ok = False
+
+    # --- Check 2: class diversity ---
+    num_classes_predicted = int(len(np.unique(y_pred))) if len(y_pred) > 0 else 0
+    class_diversity_ok = num_classes_predicted >= 2
+
+    # --- Check 3: accuracy threshold ---
+    if len(y_pred) > 0:
+        from sklearn.metrics import accuracy_score
+
+        accuracy = float(accuracy_score(y, y_pred))
+    else:
+        accuracy = 0.0
+
+    # Guard against NaN metrics (e.g. from degenerate predictions)
+    if np.isnan(accuracy):
+        logger.warning("Accuracy metric is NaN — treating as validation failure")
+        accuracy = 0.0
+
+    accuracy_ok = accuracy >= accuracy_threshold
+
+    checks = {
+        "accuracy_threshold": accuracy_ok,
+        "class_diversity": class_diversity_ok,
+        "predictions_ok": predict_ok,
+    }
+    passed = all(checks.values())
+
+    logger.info(
+        f"Validation {'PASSED' if passed else 'FAILED'}: "
+        f"accuracy={accuracy:.4f}, threshold={accuracy_threshold}, "
+        f"classes_predicted={num_classes_predicted}, checks={checks}"
+    )
+
+    return ModelValidationResult(
+        passed=passed,
+        accuracy=accuracy,
+        threshold=accuracy_threshold,
+        num_classes_predicted=num_classes_predicted,
+        prediction_failures=prediction_failures,
+        checks=checks,
+        error_message=None if passed else "Model did not pass validation gate",
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Validate trained model")
+    parser.add_argument("--model", required=True, help="Path to trained model (.joblib)")
+    parser.add_argument("--data", required=True, help="Path to feature CSV")
+    parser.add_argument("--target", required=True, help="Target column name")
+    parser.add_argument(
+        "--accuracy-threshold",
+        type=float,
+        required=True,
+        help="Minimum required accuracy (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--result-output",
+        required=True,
+        help="Path to write pass/fail result (pass or fail)",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        result = validate_model(
+            args.model,
+            args.data,
+            args.target,
+            args.accuracy_threshold,
+        )
+
+        # Write result for downstream steps
+        with open(args.result_output, "w") as f:
+            f.write("pass" if result.passed else "fail")
+
+        if result.passed:
+            print(f"Model validation PASSED (accuracy={result.accuracy:.4f})")
+        else:
+            print(
+                f"Model validation FAILED: {result.error_message} (accuracy={result.accuracy:.4f})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    except ModelTrainingError as e:
+        print(f"Validation error: {e}", file=sys.stderr)
+        sys.exit(1)

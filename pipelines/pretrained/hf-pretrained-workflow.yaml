@@ -1,0 +1,292 @@
+# Argo Workflow Template for HuggingFace Pretrained Model Pipeline
+# Demonstrates: fetching a pretrained model from HuggingFace Hub,
+# validating it with sanity inference, and registering in MLflow.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: hf-pretrained-pipeline
+  namespace: argo
+  labels:
+    app: mlops
+    pipeline: pretrained
+spec:
+  entrypoint: hf-pipeline
+  serviceAccountName: argo-workflow
+
+  # Maximum runtime (30 minutes — model download can be slow)
+  activeDeadlineSeconds: 1800
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+  arguments:
+    parameters:
+      - name: pipeline-image
+        # Pinned Git-SHA tag from build-sign-publish (mutable tags are
+        # rejected at admission; a version-shaped placeholder that was
+        # never published would ImagePullBackOff instead).
+        value: "ghcr.io/sathvikvelapaka/mlops-platform/hf-pretrained:bf516e8"
+      - name: model-id
+        value: "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+      - name: model-revision
+        # Hub commit SHA - model repos are mutable git refs, so runs pin a
+        # revision the same way pods pin image tags. fetch_model resolves
+        # branches/tags to a SHA either way; this default IS a SHA.
+        value: "714eb0fa89d2f80546fda750413ed43d93601a13"
+      - name: task
+        value: "text-classification"
+      - name: model-name
+        value: "sentiment-classifier"
+      - name: mlflow-tracking-uri
+        value: "http://mlflow.mlflow.svc.cluster.local:5000"
+      - name: model-alias
+        value: "champion"
+
+  artifactRepositoryRef:
+    configMap: artifact-repositories
+    key: default-artifact-repository
+
+  templates:
+    # Main pipeline DAG
+    - name: hf-pipeline
+      dag:
+        tasks:
+          - name: fetch-model
+            template: fetch-model
+            arguments:
+              parameters:
+                - name: model-id
+                  value: "{{workflow.parameters.model-id}}"
+                - name: model-revision
+                  value: "{{workflow.parameters.model-revision}}"
+                - name: task
+                  value: "{{workflow.parameters.task}}"
+
+          - name: validate-model
+            template: validate-model
+            dependencies: [fetch-model]
+            arguments:
+              artifacts:
+                - name: model-artifacts
+                  from: "{{tasks.fetch-model.outputs.artifacts.model-artifacts}}"
+
+          # Load-test the artifact IN THE SERVING RUNTIME IMAGE before
+          # registration - same gate as the training pipeline. The serving
+          # image's transformers/torch differ from the pipeline image's;
+          # an artifact that only loads where it was created must never
+          # earn a registry alias.
+          - name: serving-load-test
+            template: serving-load-test
+            dependencies: [validate-model]
+            arguments:
+              parameters:
+                - name: task
+                  value: "{{workflow.parameters.task}}"
+              artifacts:
+                - name: model-artifacts
+                  from: "{{tasks.validate-model.outputs.artifacts.model-artifacts}}"
+
+          - name: register-model
+            template: register-model
+            dependencies: [serving-load-test]
+            arguments:
+              parameters:
+                - name: model-name
+                  value: "{{workflow.parameters.model-name}}"
+                - name: mlflow-tracking-uri
+                  value: "{{workflow.parameters.mlflow-tracking-uri}}"
+                - name: model-alias
+                  value: "{{workflow.parameters.model-alias}}"
+              artifacts:
+                - name: model-artifacts
+                  from: "{{tasks.serving-load-test.outputs.artifacts.model-artifacts}}"
+
+    # Step 1: Fetch and validate pretrained model from HuggingFace Hub
+    - name: fetch-model
+      retryStrategy:
+        limit: 2
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: model-id
+          - name: model-revision
+          - name: task
+      outputs:
+        artifacts:
+          - name: model-artifacts
+            path: /tmp/hf-model
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/pretrained/src/fetch_model.py]
+        env:
+          # Optional: lets the fetch access gated/private models. The
+          # secret is ESO-synced only when enable_huggingface_hub_token is
+          # set (aws-platform module); absent secret = anonymous access.
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: huggingface-hub-token
+                key: token
+                optional: true
+        args:
+          - --model-id
+          - "{{inputs.parameters.model-id}}"
+          - --revision
+          - "{{inputs.parameters.model-revision}}"
+          - --output-dir
+          - /tmp/hf-model
+          - --task
+          - "{{inputs.parameters.task}}"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 2: Validate model before registration
+    - name: validate-model
+      retryStrategy:
+        limit: 1
+        retryPolicy: "OnError"
+      inputs:
+        artifacts:
+          - name: model-artifacts
+            path: /tmp/hf-model
+      outputs:
+        artifacts:
+          - name: model-artifacts
+            path: /tmp/hf-model
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/pretrained/src/validate_model.py]
+        args:
+          - --metadata
+          - /tmp/hf-model/metadata.json
+          - --output
+          - /tmp/hf-model/validation_result.json
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Gate: load and score the artifact inside the image KServe serves
+    # huggingface-format models with (kserve/huggingfaceserver - see
+    # pipelines/serving-runtime-contract.yaml). Catches transformers/torch
+    # version drift between the pipeline image and the serving runtime at
+    # pipeline time, not at pod-crashloop time.
+    - name: serving-load-test
+      retryStrategy:
+        limit: 1
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: task
+        artifacts:
+          - name: model-artifacts
+            path: /tmp/hf-model
+      outputs:
+        artifacts:
+          - name: model-artifacts
+            path: /tmp/hf-model
+      script:
+        # Must track helm_kserve_version + serving-runtime-contract.yaml.
+        image: kserve/huggingfaceserver:v0.16.0
+        command: [python]
+        source: |
+          import json
+          import sys
+
+          import transformers
+          from transformers import pipeline
+
+          print(f"Python {sys.version.split()[0]}, transformers {transformers.__version__}")
+
+          with open("/tmp/hf-model/metadata.json") as f:
+              metadata = json.load(f)
+
+          # Unpickle-free load: safetensors weights + local files only.
+          pipe = pipeline(
+              task="{{inputs.parameters.task}}",
+              model=metadata["model_dir"],
+              tokenizer=metadata["model_dir"],
+              trust_remote_code=False,
+          )
+          result = pipe(metadata["test_input"])
+          print(f"Serving load test OK - prediction: {result}")
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+    # Step 3: Register model in MLflow
+    - name: register-model
+      retryStrategy:
+        limit: 2
+        retryPolicy: "OnError"
+      inputs:
+        parameters:
+          - name: model-name
+          - name: mlflow-tracking-uri
+          - name: model-alias
+        artifacts:
+          - name: model-artifacts
+            path: /tmp/hf-model
+      container:
+        image: "{{workflow.parameters.pipeline-image}}"
+        command: [python, /app/pipelines/pretrained/src/register_model.py]
+        args:
+          - --metadata
+          - /tmp/hf-model/metadata.json
+          - --model-name
+          - "{{inputs.parameters.model-name}}"
+          - --mlflow-uri
+          - "{{inputs.parameters.mlflow-tracking-uri}}"
+          - --alias
+          - "{{inputs.parameters.model-alias}}"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+
+---
+# Workflow to run the pretrained model pipeline
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: hf-pretrained-
+  namespace: argo
+  labels:
+    app: mlops
+    pipeline: pretrained
+spec:
+  workflowTemplateRef:
+    name: hf-pretrained-pipeline

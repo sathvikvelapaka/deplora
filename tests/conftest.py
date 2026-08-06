@@ -1,0 +1,237 @@
+"""
+Pytest configuration and shared fixtures for MLOps Platform tests.
+"""
+
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock
+
+# Centralized path setup for standalone components not installed as packages
+_repo_root = Path(__file__).resolve().parents[1]
+_drift_detection_path = str(_repo_root / "components" / "drift-detection")
+_training_src_path = str(_repo_root / "pipelines" / "training" / "src")
+for _p in (_drift_detection_path, _training_src_path):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+from sklearn.datasets import load_iris  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def iris_dataframe():
+    """Load iris dataset as a pandas DataFrame."""
+    iris = load_iris()
+    df = pd.DataFrame(
+        data=np.c_[iris["data"], iris["target"]],
+        columns=iris["feature_names"] + ["target"],
+    )
+    # Convert target to species names for consistency with CSV format
+    df["species"] = df["target"].map({0: "setosa", 1: "versicolor", 2: "virginica"})
+    df = df.drop(columns=["target"])
+    # Rename columns to match expected format
+    df.columns = ["sepal_length", "sepal_width", "petal_length", "petal_width", "species"]
+    return df
+
+
+@pytest.fixture
+def temp_dir():
+    """Create a temporary directory for test files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
+
+
+@pytest.fixture
+def iris_csv_path(temp_dir, iris_dataframe):
+    """Create a temporary CSV file with iris data."""
+    csv_path = temp_dir / "iris.csv"
+    iris_dataframe.to_csv(csv_path, index=False)
+    return str(csv_path)
+
+
+@pytest.fixture
+def malformed_csv_path(temp_dir):
+    """Create a malformed CSV file for negative testing."""
+    csv_path = temp_dir / "malformed.csv"
+    csv_path.write_text('col1,col2,col3\n1,2\n3,4,5,6\n"unclosed')
+    return str(csv_path)
+
+
+@pytest.fixture
+def empty_csv_path(temp_dir):
+    """Create an empty CSV file (headers only)."""
+    csv_path = temp_dir / "empty.csv"
+    csv_path.write_text("col1,col2,col3\n")
+    return str(csv_path)
+
+
+@pytest.fixture
+def all_null_csv_path(temp_dir):
+    """Create a CSV file with all null values (Iris columns)."""
+    csv_path = temp_dir / "all_null.csv"
+    csv_path.write_text(
+        "sepal_length,sepal_width,petal_length,petal_width,species\n,,,,\n,,,,\n,,,,\n"
+    )
+    return str(csv_path)
+
+
+@pytest.fixture
+def csv_with_nulls_path(temp_dir):
+    """Create a CSV file with some null values that can still be cleaned."""
+    csv_path = temp_dir / "with_nulls.csv"
+    # 15 rows total, 5 with nulls = 10 clean rows (meets minimum)
+    data = """sepal_length,sepal_width,petal_length,petal_width,species
+5.1,3.5,1.4,0.2,setosa
+4.9,3.0,1.4,0.2,setosa
+4.7,3.2,1.3,0.2,setosa
+,3.1,1.5,0.2,setosa
+5.0,3.6,1.4,0.2,setosa
+5.4,3.9,1.7,0.4,setosa
+4.6,3.4,1.4,0.3,setosa
+5.0,,1.5,0.2,setosa
+4.4,2.9,1.4,0.2,setosa
+4.9,3.1,1.5,0.1,setosa
+5.4,3.7,1.5,0.2,setosa
+4.8,3.4,,0.2,setosa
+4.8,3.0,1.4,0.1,setosa
+4.3,3.0,1.1,0.1,setosa
+5.8,4.0,1.2,,setosa
+"""
+    csv_path.write_text(data)
+    return str(csv_path)
+
+
+@pytest.fixture
+def numeric_only_csv_path(temp_dir):
+    """Create a CSV file with only numeric columns."""
+    csv_path = temp_dir / "numeric.csv"
+    data = """a,b,c,target
+1.0,2.0,3.0,0
+4.0,5.0,6.0,1
+7.0,8.0,9.0,0
+10.0,11.0,12.0,1
+13.0,14.0,15.0,0
+16.0,17.0,18.0,1
+19.0,20.0,21.0,0
+22.0,23.0,24.0,1
+25.0,26.0,27.0,0
+28.0,29.0,30.0,1
+31.0,32.0,33.0,0
+"""
+    csv_path.write_text(data)
+    return str(csv_path)
+
+
+@pytest.fixture
+def mock_mlflow_client(mocker):
+    """Create a mock MLflow client for register_model tests."""
+    mock_client = MagicMock()
+
+    # Mock run with metrics
+    mock_run = MagicMock()
+    mock_run.data.metrics = {"accuracy": 0.95, "f1_score": 0.94}
+    mock_client.get_run.return_value = mock_run
+
+    # Mock model version
+    mock_version = MagicMock()
+    mock_version.version = "1"
+    mocker.patch("mlflow.register_model", return_value=mock_version)
+
+    mocker.patch("mlflow.set_tracking_uri")
+    # Patch where it's used, not where it's defined
+    mocker.patch(
+        "pipelines.training.src.register_model.MlflowClient",
+        return_value=mock_client,
+    )
+
+    return mock_client
+
+
+@pytest.fixture
+def mock_mlflow_client_low_accuracy(mocker):
+    """Create a mock MLflow client with low accuracy for threshold tests."""
+    mock_client = MagicMock()
+
+    # Mock run with low accuracy
+    mock_run = MagicMock()
+    mock_run.data.metrics = {"accuracy": 0.5, "f1_score": 0.45}
+    mock_client.get_run.return_value = mock_run
+
+    mocker.patch("mlflow.set_tracking_uri")
+    # Patch where it's used, not where it's defined
+    mocker.patch(
+        "pipelines.training.src.register_model.MlflowClient",
+        return_value=mock_client,
+    )
+
+    return mock_client
+
+
+@pytest.fixture
+def csv_with_categorical_path(temp_dir):
+    """Create a CSV file with mixed numeric and categorical columns."""
+    csv_path = temp_dir / "categorical.csv"
+    data = """age,income,city,gender,target
+25,50000,NYC,M,0
+30,60000,LA,F,1
+35,70000,NYC,M,0
+40,80000,Chicago,F,1
+45,90000,LA,M,0
+50,100000,NYC,F,1
+55,110000,Chicago,M,0
+60,120000,LA,F,1
+65,130000,NYC,M,0
+70,140000,Chicago,F,1
+75,150000,LA,M,0
+"""
+    csv_path.write_text(data)
+    return str(csv_path)
+
+
+@pytest.fixture
+def csv_with_high_cardinality_path(temp_dir):
+    """Create a CSV file with high cardinality categorical column."""
+    csv_path = temp_dir / "high_cardinality.csv"
+    # 15 unique IDs - too many for encoding with max_categories=10
+    data = """id,value,target
+id_001,10,0
+id_002,20,1
+id_003,30,0
+id_004,40,1
+id_005,50,0
+id_006,60,1
+id_007,70,0
+id_008,80,1
+id_009,90,0
+id_010,100,1
+id_011,110,0
+id_012,120,1
+id_013,130,0
+id_014,140,1
+id_015,150,0
+"""
+    csv_path.write_text(data)
+    return str(csv_path)
+
+
+@pytest.fixture
+def trained_model_artifacts(temp_dir, iris_dataframe):
+    """Create artifacts needed for model training tests."""
+    # Save processed data
+    data_path = temp_dir / "processed.csv"
+    iris_dataframe.to_csv(data_path, index=False)
+
+    # Create output paths
+    model_path = temp_dir / "model.joblib"
+    run_id_path = temp_dir / "run_id.txt"
+    accuracy_path = temp_dir / "accuracy.txt"
+
+    return {
+        "data_path": str(data_path),
+        "model_path": str(model_path),
+        "run_id_path": str(run_id_path),
+        "accuracy_path": str(accuracy_path),
+    }

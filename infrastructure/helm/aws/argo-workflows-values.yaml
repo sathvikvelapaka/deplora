@@ -1,0 +1,135 @@
+# Argo Workflows values for ML pipeline orchestration
+# Lightweight configuration without database persistence
+
+# Controller configuration
+controller:
+  replicas: 1
+
+  # Pod security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 8737
+    fsGroup: 8737
+
+  # Container security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 8737
+    privileged: false
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Workflow defaults
+  workflowDefaults:
+    spec:
+      # Default TTL for completed workflows
+      ttlStrategy:
+        secondsAfterCompletion: 86400   # 24 hours
+        secondsAfterSuccess: 43200      # 12 hours
+        secondsAfterFailure: 172800     # 48 hours
+
+      # Pod garbage collection
+      podGC:
+        strategy: OnPodCompletion
+
+  # Disable database persistence completely (use Kubernetes CRDs only)
+  # Empty object = no persistence config = no database required
+  persistence: {}
+
+  # Metrics for Prometheus
+  metricsConfig:
+    enabled: true
+
+# Server (UI) configuration
+server:
+  replicas: 1
+
+  # Pod security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 8737
+    fsGroup: 8737
+
+  # Container security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 8737
+    privileged: false
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false  # Server needs write access
+    capabilities:
+      drop:
+        - ALL
+
+  # Expose via ClusterIP (use port-forward or ingress)
+  serviceType: ClusterIP
+
+  # Auth mode - client for dev, sso for production
+  authModes:
+    - client
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
+
+  # Extra arguments
+  extraArgs:
+    - --auth-mode=client
+
+# Artifact repository configuration
+artifactRepository:
+  # Use MinIO for S3-compatible artifact storage
+  s3:
+    endpoint: minio.argo.svc:9000
+    bucket: mlpipeline
+    # insecure: true — MinIO runs in-cluster without TLS.
+    # Network policy restricts access to argo namespace only.
+    # For production with sensitive data, enable MinIO TLS.
+    insecure: true
+    accessKeySecret:
+      name: minio
+      key: rootUser
+    secretKeySecret:
+      name: minio
+      key: rootPassword
+
+# Workflow templates
+workflowTemplates:
+  # Enable workflow templates CRD
+  enabled: true
+
+# Use emissary executor (recommended)
+# Tag should match Argo Workflows version (chart 0.47.3 = app v3.7.x)
+executor:
+  image:
+    registry: quay.io
+    repository: argoproj/argoexec
+    tag: v3.7.2
+
+# RBAC configuration
+createAggregateRoles: true
+
+# Service account
+workflow:
+  serviceAccount:
+    create: true
+    name: argo-workflow
+
+  rbac:
+    create: true

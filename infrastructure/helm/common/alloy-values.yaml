@@ -1,0 +1,85 @@
+# Grafana Alloy Helm Values - Unified Telemetry Collector
+# Chart: grafana/alloy
+# Replaces Promtail as the recommended log shipping agent for Loki
+# Alloy uses River configuration language for pipeline definitions
+
+alloy:
+  configMap:
+    content: |
+      // Kubernetes log discovery
+      discovery.kubernetes "pods" {
+        role = "pod"
+      }
+
+      // Relabel to add namespace, pod, container labels
+      discovery.relabel "pods" {
+        targets = discovery.kubernetes.pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          regex         = "argo|mlflow|kserve|monitoring|argocd|mlops"
+          action        = "keep"
+        }
+      }
+
+      // Collect logs from discovered pods
+      loki.source.kubernetes "pods" {
+        targets    = discovery.relabel.pods.output
+        forward_to = [loki.process.pipeline.receiver]
+      }
+
+      // Processing pipeline - add static labels
+      loki.process "pipeline" {
+        stage.static_labels {
+          values = {
+            platform = "mlops",
+          }
+        }
+        forward_to = [loki.write.default.receiver]
+      }
+
+      // Ship logs to Loki
+      loki.write "default" {
+        endpoint {
+          url       = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+          tenant_id = "mlops"
+        }
+      }
+
+controller:
+  type: daemonset
+
+# Note: DaemonSet needs host log access, so readOnlyRootFilesystem
+# and runAsNonRoot may not be feasible. Add what the chart supports.
+securityContext:
+  runAsUser: 0  # Required for reading host log files
+  privileged: false
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+tolerations:
+  - effect: NoSchedule
+    operator: Exists
+
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: prometheus

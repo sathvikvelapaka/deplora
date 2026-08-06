@@ -1,0 +1,43 @@
+# Sloth PrometheusServiceLevel for inference P99 latency SLO.
+apiVersion: sloth.slok.dev/v1
+kind: PrometheusServiceLevel
+metadata:
+  name: inference-latency
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/component: slo
+spec:
+  service: inference
+  labels:
+    team: platform
+  slos:
+    - name: requests-latency
+      objective: 99
+      description: "99% of time windows should have P99 latency < 500ms"
+      sli:
+        events:
+          # MLServer's duration histogram is native seconds; its default
+          # buckets have no 0.5 boundary, so the SLI uses le="0.5"'s nearest
+          # existing bucket boundary 0.5 -> verified present in the runtime
+          # image's bucket set (0.005..10). 500ms = le="0.5".
+          errorQuery: >
+            (
+              sum(rate(rest_server_request_duration_seconds_count{namespace="mlops",path=~".*/infer"}[{{.window}}]))
+              -
+              sum(rate(rest_server_request_duration_seconds_bucket{namespace="mlops",path=~".*/infer",le="0.5"}[{{.window}}]))
+            )
+          totalQuery: >
+            sum(rate(rest_server_request_duration_seconds_count{namespace="mlops",path=~".*/infer"}[{{.window}}]))
+      alerting:
+        name: InferenceLatencyBurnRate
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Inference P99 latency SLO burn rate is too high"
+        pageAlert:
+          labels:
+            severity: critical
+        ticketAlert:
+          labels:
+            severity: warning

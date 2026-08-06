@@ -1,0 +1,75 @@
+# AnalysisTemplate for canary analysis (ADR-016).
+#
+# Consumed as a standalone AnalysisRun by the promote flow: KServe's
+# canaryTrafficPercent shifts traffic, this template judges the canary via
+# the MLServer metrics that actually exist in RawDeployment mode (verified
+# against the pinned runtime image - see serving-runtime-contract.yaml),
+# and the flow acts on the verdict: failure => canaryTrafficPercent: 0.
+#
+# canary-pods-regex selects the canary pods via the `pod` label. The exact
+# canary pod-naming convention under RawDeployment is confirmed in the
+# Phase B spike (ADR-016 consequences); the selector is an argument so
+# correcting it never restructures this template.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: ml-model-canary-analysis
+  namespace: mlops
+spec:
+  args:
+    - name: service-name
+    - name: canary-pods-regex
+      # Verified RawDeployment behavior (ADR-016): canaryTrafficPercent is
+      # ignored - a challenger rollout replaces the predictor pods in
+      # place, so the analysis judges ALL current predictor pods.
+      value: "{{args.service-name}}-predictor-.*"
+  metrics:
+    # Success rate must be >= 95% during canary window
+    # NOTE: all gates assume live traffic during the analysis window - the
+    # verification flow drives load (scripts/demo/traffic or real clients).
+    # Empty-window guards (or vector(0), clamp_min) keep the math defined;
+    # the first live run returned NaN/empty and errored the AnalysisRun.
+    - name: success-rate
+      initialDelay: 60s
+      interval: 60s
+      count: 5
+      successCondition: result[0] >= 0.95
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+          query: |
+            (sum(rate(rest_server_requests_total{status_code=~"2..",inference_service="{{args.service-name}}",pod=~"{{args.canary-pods-regex}}",path=~".*/infer"}[2m])) or vector(0))
+            /
+            clamp_min(sum(rate(rest_server_requests_total{inference_service="{{args.service-name}}",pod=~"{{args.canary-pods-regex}}",path=~".*/infer"}[2m])), 1e-10)
+
+    # P95 latency must be <= 500ms (duration histogram is native seconds)
+    - name: latency-p95
+      initialDelay: 60s
+      interval: 60s
+      count: 5
+      successCondition: result[0] <= 500
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+          query: |
+            (histogram_quantile(0.95,
+              sum(rate(rest_server_request_duration_seconds_bucket{inference_service="{{args.service-name}}",pod=~"{{args.canary-pods-regex}}",path=~".*/infer"}[2m])) by (le)
+            ) * 1000) or vector(0)
+
+    # Error rate must be < 5%
+    - name: error-rate
+      initialDelay: 60s
+      interval: 60s
+      count: 5
+      successCondition: result[0] < 0.05
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-kube-prometheus-prometheus.monitoring:9090
+          query: |
+            (sum(rate(rest_server_requests_total{status_code!~"2..",inference_service="{{args.service-name}}",pod=~"{{args.canary-pods-regex}}",path=~".*/infer"}[2m])) or vector(0))
+            /
+            clamp_min(sum(rate(rest_server_requests_total{inference_service="{{args.service-name}}",pod=~"{{args.canary-pods-regex}}",path=~".*/infer"}[2m])), 1e-10)
