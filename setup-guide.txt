@@ -1,0 +1,530 @@
+# 🚀 Deployra — Complete Local Setup & Execution Guide
+
+Welcome to **Deployra**!
+
+Deployra is an open-source, cloud-native MLOps platform that automates the complete machine learning lifecycle—from model training and experiment tracking to deployment, monitoring, and scaling.
+
+This guide will help you install everything, run the platform locally, and test it like an end user.
+
+---
+
+# 📋 What You'll Build
+
+After completing this guide, you'll have a fully functional local MLOps platform running on your computer with:
+
+- ✅ Kubernetes Cluster (Kind)
+- ✅ MLflow
+- ✅ Argo Workflows
+- ✅ ArgoCD
+- ✅ MinIO Object Storage
+- ✅ PostgreSQL
+- ✅ Sample ML Training Pipeline
+
+---
+
+# 🖥️ System Requirements
+
+### Minimum
+
+- 8 GB RAM
+- 20 GB Free Storage
+- 4 CPU Cores
+
+### Recommended
+
+- 16 GB RAM
+- Apple Silicon (M-Series) or Intel i7/Ryzen 7+
+- Docker Desktop 4.x+
+
+---
+
+# 📦 Step 1 — Install Required Software
+
+Choose your operating system.
+
+---
+
+# 🍎 macOS
+
+## Install Homebrew (Skip if already installed)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Verify:
+
+```bash
+brew --version
+```
+
+---
+
+## Install Docker Desktop
+
+Download and install:
+
+https://www.docker.com/products/docker-desktop/
+
+⚠️ **Important**
+
+Open Docker Desktop and wait until it shows:
+
+> Docker Desktop is running
+
+Do **not** continue until Docker is running.
+
+---
+
+## Install Required CLI Tools
+
+```bash
+brew install kind kubectl helm argocd argo make
+```
+
+Verify installation:
+
+```bash
+docker --version
+kubectl version --client
+kind version
+helm version
+argo version
+argocd version
+```
+
+---
+
+# 🐧 Ubuntu / Debian
+
+## Install Docker
+
+```bash
+sudo apt update
+
+sudo apt install -y docker.io make
+
+sudo systemctl enable docker
+
+sudo systemctl start docker
+
+sudo usermod -aG docker $USER
+
+newgrp docker
+```
+
+---
+
+## Install kubectl
+
+```bash
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+sudo install kubectl /usr/local/bin/
+```
+
+---
+
+## Install Kind
+
+```bash
+curl -Lo kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+
+chmod +x kind
+
+sudo mv kind /usr/local/bin/
+```
+
+---
+
+## Install Helm
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+```
+
+---
+
+## Install Argo CLI
+
+```bash
+curl -sLO https://github.com/argoproj/argo-workflows/releases/latest/download/argo-linux-amd64.gz
+
+gunzip argo-linux-amd64.gz
+
+chmod +x argo-linux-amd64
+
+sudo mv argo-linux-amd64 /usr/local/bin/argo
+```
+
+---
+
+## Install ArgoCD CLI
+
+```bash
+curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+
+chmod +x argocd
+
+sudo mv argocd /usr/local/bin/
+```
+
+---
+
+# 🪟 Windows
+
+Install:
+
+- Docker Desktop
+- WSL2
+- Ubuntu
+
+Inside Ubuntu, follow the Linux installation steps above.
+
+---
+
+# 📁 Step 2 — Open the Project
+
+Open Terminal.
+
+Go to the project folder.
+
+```bash
+cd /path/to/deployra
+```
+
+Example:
+
+```bash
+cd ~/Desktop/deployra
+```
+
+---
+
+# 🐳 Step 3 — Start Docker Desktop
+
+Make sure Docker Desktop is running.
+
+Verify:
+
+```bash
+docker ps
+```
+
+Expected output:
+
+```text
+CONTAINER ID
+```
+
+No error means Docker is working.
+
+---
+
+# 🚀 Step 4 — Deploy Deployra
+
+Run:
+
+```bash
+make deploy-local
+```
+
+or
+
+```bash
+make d
+```
+
+This command automatically:
+
+- Creates a Kind Kubernetes Cluster
+- Installs PostgreSQL
+- Installs MinIO
+- Installs MLflow
+- Installs Argo Workflows
+- Installs ArgoCD
+- Configures Kubernetes
+- Creates namespaces
+- Waits until everything is healthy
+
+⏳ This usually takes **5–10 minutes**.
+
+---
+
+# ✅ Step 5 — Verify Everything
+
+Run:
+
+```bash
+make status-local
+```
+
+Expected:
+
+- All pods should be **Running**
+- No CrashLoopBackOff
+- No Pending pods
+
+You can also verify manually:
+
+```bash
+kubectl get pods -A
+```
+
+---
+
+# 🌐 Step 6 — Open the Platform
+
+## MLflow
+
+Track experiments and models.
+
+http://localhost:15000
+
+No login required.
+
+---
+
+## ArgoCD
+
+GitOps Dashboard
+
+http://localhost:8080
+
+Username:
+
+```text
+admin
+```
+
+Password:
+
+```text
+admin
+```
+
+---
+
+## Argo Workflows
+
+Pipeline Dashboard
+
+http://localhost:2746
+
+---
+
+## MinIO
+
+Object Storage
+
+http://localhost:9001
+
+Username
+
+```text
+minio
+```
+
+Password
+
+```text
+minio123
+```
+
+---
+
+# 🧪 Step 7 — Run Your First ML Pipeline
+
+Deploy the workflow:
+
+```bash
+kubectl apply -f pipelines/training/ml-training-workflow.yaml \
+--context kind-mlops-local
+```
+
+Start the workflow:
+
+```bash
+argo submit \
+--from workflowtemplate/ml-training-pipeline \
+-n argo \
+--context kind-mlops-local
+```
+
+---
+
+# 👀 Step 8 — Watch It Execute
+
+Open:
+
+http://localhost:2746
+
+You'll see:
+
+- Data Loading
+- Feature Engineering
+- Model Training
+- Validation
+- MLflow Registration
+- Deployment
+
+Each stage updates live.
+
+---
+
+# 📊 Step 9 — Verify the Model
+
+Open MLflow:
+
+http://localhost:15000
+
+Verify:
+
+- Experiment created
+- Parameters
+- Metrics
+- Model artifacts
+- Registered model
+
+---
+
+# 📦 Step 10 — Explore the Platform
+
+Try:
+
+✅ Browse MLflow
+
+✅ Explore ArgoCD Applications
+
+✅ Check MinIO buckets
+
+✅ View Workflow Logs
+
+✅ Restart a pipeline
+
+✅ Deploy another model
+
+---
+
+# 🛠️ Useful Commands
+
+Deploy Platform
+
+```bash
+make deploy-local
+```
+
+Check Status
+
+```bash
+make status-local
+```
+
+View Pods
+
+```bash
+kubectl get pods -A
+```
+
+View Services
+
+```bash
+kubectl get svc -A
+```
+
+Delete Platform
+
+```bash
+make destroy-local
+```
+
+---
+
+# 🧹 Clean Up
+
+When you're finished:
+
+```bash
+make destroy-local
+```
+
+This removes:
+
+- Kubernetes Cluster
+- Containers
+- Volumes
+- Local Resources
+
+Your project files remain untouched.
+
+---
+
+# 🚨 Troubleshooting
+
+## Docker Not Running
+
+Error:
+
+```text
+Cannot connect to Docker daemon
+```
+
+Solution:
+
+Start Docker Desktop.
+
+---
+
+## Port Already In Use
+
+Find the process:
+
+```bash
+lsof -i :15000
+```
+
+Kill it or change the port.
+
+---
+
+## Pods Stuck
+
+Check:
+
+```bash
+kubectl get pods -A
+```
+
+Then:
+
+```bash
+kubectl describe pod <pod-name> -n <namespace>
+```
+
+---
+
+## Reset Everything
+
+```bash
+make destroy-local
+
+make deploy-local
+```
+
+---
+
+# 🎉 Congratulations!
+
+You now have a complete cloud-native MLOps platform running locally.
+
+From here, you can:
+
+- Train models
+- Deploy models
+- Monitor experiments
+- Scale workloads
+- Automate CI/CD
+- Explore GitOps
+- Learn production MLOps
+
+Welcome to **Deployra** 🚀
