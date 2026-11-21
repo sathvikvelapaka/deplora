@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Deplora CLI launcher wrapper
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+cd "${SCRIPT_DIR}"
+
+if [ -f "${SCRIPT_DIR}/.venv/bin/python" ]; then
+    exec "${SCRIPT_DIR}/.venv/bin/python" -m deplora.cli "$@"
+else
+    exec uv run --no-sync python -m deplora.cli "$@"
+fi

@@ -235,7 +235,7 @@ validate-terraform-gcp:
 
 validate-python:
 	@echo "Validating Python code..."
-	@$(PYTHON) -c "import yaml; list(yaml.safe_load_all(open('pipelines/training/ml-training-workflow.yaml')))"
+	@uv run python -c "import yaml; list(yaml.safe_load_all(open('pipelines/training/ml-training-workflow.yaml')))"
 	@echo "Python validation passed"
 
 lint: lint-python lint-terraform
@@ -306,7 +306,7 @@ port-forward-argo-rollouts:
 
 validate-workflow:
 	@echo "Validating Argo Workflow..."
-	@$(PYTHON) -c "import yaml; list(yaml.safe_load_all(open('$(PIPELINE_DIR)/ml-training-workflow.yaml')))"
+	@uv run python -c "import yaml; list(yaml.safe_load_all(open('$(PIPELINE_DIR)/ml-training-workflow.yaml')))"
 	@echo "Argo Workflow YAML is valid"
 
 deploy-example:
